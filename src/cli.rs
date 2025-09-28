@@ -106,13 +106,13 @@ pub struct CommonOptions {
     #[arg(long, default_value = "viddupe.db")]
     pub db: PathBuf,
 
-    /// Number of parallel file processing jobs
-    #[arg(long, default_value = "4")]
-    pub jobs: usize,
+    /// Number of parallel file processing jobs (number or 'auto')
+    #[arg(long, default_value = "auto")]
+    pub jobs: String,
 
-    /// Number of parallel ffmpeg processes
-    #[arg(long, default_value = "2")]
-    pub ffmpeg_par: usize,
+    /// Number of parallel ffmpeg processes (number or 'auto')
+    #[arg(long, default_value = "auto")]
+    pub ffmpeg_par: String,
 
     /// Average perceptual hash distance threshold
     #[arg(long, default_value = "6")]

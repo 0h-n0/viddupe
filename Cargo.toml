@@ -57,6 +57,7 @@ log = "0.4"
 env_logger = "0.10"
 humansize = "2.1"
 uuid = { version = "1.6", features = ["v4"] }
+num_cpus = "1.16"
 
 # Cross-platform path handling
 dunce = "1.0"

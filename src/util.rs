@@ -7,6 +7,160 @@ use std::time::Instant;
 
 use crate::{cli, cluster::DuplicateCluster, db, scan::VideoFile};
 
+/// Optimized job configuration based on system hardware
+#[derive(Debug, Clone)]
+pub struct OptimizedConfig {
+    pub jobs: usize,
+    pub ffmpeg_par: usize,
+    pub gpu_accel: String,
+    pub reasoning: String,
+}
+
+impl OptimizedConfig {
+    /// Create optimized configuration based on system analysis
+    pub fn from_user_input(jobs_str: &str, ffmpeg_par_str: &str, gpu_accel: &str) -> Self {
+        let jobs = parse_job_count(jobs_str);
+        let ffmpeg_par = parse_ffmpeg_par(ffmpeg_par_str);
+
+        if jobs_str == "auto" || ffmpeg_par_str == "auto" {
+            Self::auto_optimize(jobs, ffmpeg_par, gpu_accel)
+        } else {
+            Self {
+                jobs,
+                ffmpeg_par,
+                gpu_accel: gpu_accel.to_string(),
+                reasoning: "User-specified values".to_string(),
+            }
+        }
+    }
+
+    /// Automatically optimize job counts based on system capabilities
+    fn auto_optimize(manual_jobs: usize, manual_ffmpeg_par: usize, gpu_accel: &str) -> Self {
+        let cpu_cores = num_cpus::get();
+        let physical_cores = num_cpus::get_physical();
+        let has_gpu = !detect_gpu_acceleration().is_empty() && gpu_accel != "cpu";
+
+        // Analyze system memory (rough estimation)
+        let available_memory_gb = get_available_memory_gb();
+
+        // Calculate optimal job counts
+        let (jobs, ffmpeg_par, reasoning) = calculate_optimal_jobs(
+            cpu_cores,
+            physical_cores,
+            has_gpu,
+            available_memory_gb,
+            manual_jobs,
+            manual_ffmpeg_par,
+        );
+
+        Self { jobs, ffmpeg_par, gpu_accel: gpu_accel.to_string(), reasoning }
+    }
+}
+
+fn parse_job_count(jobs_str: &str) -> usize {
+    if jobs_str == "auto" {
+        0 // Will be calculated later
+    } else {
+        jobs_str.parse().unwrap_or(4)
+    }
+}
+
+fn parse_ffmpeg_par(ffmpeg_par_str: &str) -> usize {
+    if ffmpeg_par_str == "auto" {
+        0 // Will be calculated later
+    } else {
+        ffmpeg_par_str.parse().unwrap_or(2)
+    }
+}
+
+/// Calculate optimal job distribution based on system resources
+fn calculate_optimal_jobs(
+    cpu_cores: usize,
+    physical_cores: usize,
+    has_gpu: bool,
+    memory_gb: usize,
+    manual_jobs: usize,
+    manual_ffmpeg_par: usize,
+) -> (usize, usize, String) {
+    let mut reasoning = Vec::new();
+
+    // Base calculations
+    let logical_cores = cpu_cores;
+    reasoning.push(format!("System: {} logical cores, {} physical cores", logical_cores, physical_cores));
+
+    if has_gpu {
+        reasoning.push("GPU acceleration detected".to_string());
+    }
+
+    // Calculate optimal job count
+    let optimal_jobs = if manual_jobs > 0 {
+        manual_jobs
+    } else {
+        // Base on I/O and CPU intensive work
+        let base_jobs = if has_gpu {
+            // With GPU, CPU is less loaded for video processing
+            (logical_cores as f64 * 1.5) as usize
+        } else {
+            // CPU-only processing is more CPU intensive
+            logical_cores.max(4)
+        };
+
+        // Limit by memory (rough estimate: 200MB per job)
+        let memory_limited_jobs = (memory_gb * 1024 / 200).max(2);
+
+        let final_jobs = base_jobs.min(memory_limited_jobs).min(32); // Cap at 32
+        reasoning.push(format!("Optimal jobs: {} (base: {}, memory-limited: {})",
+                              final_jobs, base_jobs, memory_limited_jobs));
+        final_jobs
+    };
+
+    // Calculate optimal ffmpeg parallel count
+    let optimal_ffmpeg_par = if manual_ffmpeg_par > 0 {
+        manual_ffmpeg_par
+    } else {
+        let base_ffmpeg = if has_gpu {
+            // GPU can handle more parallel ffmpeg processes
+            (physical_cores / 2).max(3).min(8)
+        } else {
+            // CPU-only needs to be conservative
+            (physical_cores / 3).max(2).min(4)
+        };
+
+        // Ensure ffmpeg_par doesn't exceed jobs
+        let final_ffmpeg = base_ffmpeg.min(optimal_jobs);
+        reasoning.push(format!("Optimal ffmpeg processes: {} (considering GPU: {})",
+                              final_ffmpeg, has_gpu));
+        final_ffmpeg
+    };
+
+    (optimal_jobs, optimal_ffmpeg_par, reasoning.join(", "))
+}
+
+/// Get available system memory in GB (rough estimation)
+fn get_available_memory_gb() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|content| {
+                content.lines()
+                    .find(|line| line.starts_with("MemAvailable:"))
+                    .and_then(|line| {
+                        line.split_whitespace()
+                            .nth(1)
+                            .and_then(|kb| kb.parse::<usize>().ok())
+                            .map(|kb| kb / 1024 / 1024) // Convert KB to GB
+                    })
+            })
+            .unwrap_or(8) // Default to 8GB if can't detect
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        8 // Default fallback for non-Linux systems
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GpuAccelConfig {
     pub hwaccel: Option<String>,
@@ -263,7 +417,15 @@ pub async fn process_files_parallel(
     common_options: &cli::CommonOptions,
     progress: indicatif::ProgressBar,
 ) -> Result<usize> {
-    info!("Processing {} files with {} parallel jobs", files.len(), common_options.jobs);
+    // Create optimized configuration
+    let optimized_config = OptimizedConfig::from_user_input(
+        &common_options.jobs,
+        &common_options.ffmpeg_par,
+        &common_options.gpu_accel,
+    );
+
+    info!("Processing {} files with {} parallel jobs ({})",
+          files.len(), optimized_config.jobs, optimized_config.reasoning);
 
     let start_time = Instant::now();
     let total_files = files.len();
@@ -290,12 +452,12 @@ pub async fn process_files_parallel(
     info!("Processing {} new/changed files", files_to_process.len());
 
     // Use parallel processing for computation with batched database writes
-    let batch_size = (common_options.jobs * 2).max(10).min(50);
+    let batch_size = (optimized_config.jobs * 2).max(10).min(50);
     let processed_count = process_files_in_batches(
         files_to_process,
         db_conn,
         scan_options,
-        common_options,
+        &optimized_config,
         progress_tracker,
         batch_size,
     ).await?;
@@ -398,7 +560,7 @@ async fn process_files_in_batches(
     files: Vec<VideoFile>,
     db_conn: &rusqlite::Connection,
     scan_options: &cli::ScanOptions,
-    common_options: &cli::CommonOptions,
+    optimized_config: &OptimizedConfig,
     progress_tracker: Arc<ProgressTracker>,
     batch_size: usize,
 ) -> Result<usize> {
@@ -409,10 +571,10 @@ async fn process_files_in_batches(
     let mut batch_results = Vec::new();
 
     // Create semaphore to limit concurrent processing
-    let semaphore = Arc::new(Semaphore::new(common_options.jobs));
+    let semaphore = Arc::new(Semaphore::new(optimized_config.jobs));
 
     // Process files in chunks to avoid overwhelming the system
-    let chunk_size = (common_options.jobs * 4).max(batch_size);
+    let chunk_size = (optimized_config.jobs * 4).max(batch_size);
 
     for chunk in files.chunks(chunk_size) {
         let mut futures = FuturesUnordered::new();
@@ -421,7 +583,7 @@ async fn process_files_in_batches(
         for video_file in chunk {
             let video_file = video_file.clone();
             let scan_options = scan_options.clone();
-            let common_options = common_options.clone();
+            let optimized_config = optimized_config.clone();
             let semaphore = semaphore.clone();
 
             let future = async move {
@@ -432,7 +594,7 @@ async fn process_files_in_batches(
                     .to_string();
 
                 debug!("Starting to process file: {}", filename);
-                match process_single_file_compute(&video_file, &scan_options, &common_options).await {
+                match process_single_file_compute(&video_file, &scan_options, &optimized_config).await {
                     Ok(result) => {
                         debug!("Completed processing file: {}", filename);
                         Some(result)
@@ -549,12 +711,12 @@ struct AnalysisResult {
 async fn process_single_file_compute(
     video_file: &VideoFile,
     scan_options: &cli::ScanOptions,
-    common_options: &cli::CommonOptions,
+    optimized_config: &OptimizedConfig,
 ) -> Result<AnalysisResult> {
     debug!("Processing file: {}", video_file.path.display());
 
     // Initialize GPU acceleration config
-    let gpu_config = GpuAccelConfig::from_user_selection(&common_options.gpu_accel);
+    let gpu_config = GpuAccelConfig::from_user_selection(&optimized_config.gpu_accel);
 
     // Stage 0: Extract metadata
     let metadata = crate::meta::extract_metadata(&video_file.path).await?;
