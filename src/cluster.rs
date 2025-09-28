@@ -59,7 +59,7 @@ impl DuplicateCluster {
 
 impl ClusterFile {
     fn from_file_record(record: &FileRecord) -> Self {
-        let quality_score = meta::calculate_quality_score(&record.metadata);
+        let quality_score = meta::calculate_comprehensive_quality_score(&record.metadata, &record.path);
 
         Self {
             id: record.id,

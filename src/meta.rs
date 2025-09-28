@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
+use regex::Regex;
 
 use crate::db::VideoMetadata;
 
@@ -261,10 +262,125 @@ impl std::fmt::Display for CodecClass {
     }
 }
 
-/// Calculate quality score for file comparison
+/// Analyze filename for language content and informativeness
+pub fn analyze_filename_quality(file_path: &Path) -> FilenameQuality {
+    let filename = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+
+    let mut japanese_chars = 0;
+    let mut english_chars = 0;
+    let mut total_chars = 0;
+    let mut word_count = 0;
+    let mut special_info_score = 0;
+
+    // Count character types
+    for ch in filename.chars() {
+        if ch.is_ascii_alphabetic() {
+            english_chars += 1;
+        } else if is_japanese_char(ch) {
+            japanese_chars += 1;
+        }
+        if ch.is_alphanumeric() || is_japanese_char(ch) {
+            total_chars += 1;
+        }
+    }
+
+    // Count words (split by common separators)
+    let word_separators = regex::Regex::new(r"[\s\-_\.\[\]\(\)]+").unwrap();
+    word_count = word_separators.split(filename)
+        .filter(|word| !word.is_empty() && word.len() > 1)
+        .count();
+
+    // Look for special information indicators
+    let info_patterns = [
+        (r"(?i)(1080p|720p|480p|4k|uhd|hd)", 5), // Resolution info
+        (r"(?i)(h264|h265|hevc|av1|vp9)", 3),    // Codec info
+        (r"(?i)(web-?dl|bluray|bdrip|dvd)", 4),  // Source info
+        (r"(?i)(eng|jap|jpn|sub|dub)", 3),       // Language info
+        (r"(?i)(ep\d+|episode|第\d+話)", 4),      // Episode info
+        (r"\d{4}", 2),                           // Year info
+        (r"(?i)(repack|proper|extended)", 2),    // Version info
+    ];
+
+    for (pattern, score) in &info_patterns {
+        if regex::Regex::new(pattern).unwrap().is_match(filename) {
+            special_info_score += score;
+        }
+    }
+
+    FilenameQuality {
+        japanese_chars,
+        english_chars,
+        total_chars,
+        word_count,
+        special_info_score,
+        informativeness_score: calculate_informativeness_score(
+            japanese_chars, english_chars, word_count, special_info_score, total_chars
+        ),
+    }
+}
+
+fn is_japanese_char(ch: char) -> bool {
+    matches!(ch,
+        '\u{3040}'..='\u{309F}' |  // Hiragana
+        '\u{30A0}'..='\u{30FF}' |  // Katakana
+        '\u{4E00}'..='\u{9FAF}' |  // CJK Unified Ideographs (Kanji)
+        '\u{3400}'..='\u{4DBF}'    // CJK Extension A
+    )
+}
+
+fn calculate_informativeness_score(
+    japanese_chars: usize,
+    english_chars: usize,
+    word_count: usize,
+    special_info_score: usize,
+    total_chars: usize
+) -> f64 {
+    let mut score = 0.0;
+
+    // Base score from character diversity
+    if japanese_chars > 0 && english_chars > 0 {
+        score += 20.0; // Bonus for multilingual filenames
+    } else if japanese_chars > 5 {
+        score += 15.0; // Good Japanese description
+    } else if english_chars > 10 {
+        score += 10.0; // Good English description
+    }
+
+    // Word count score (more words = more descriptive)
+    score += (word_count as f64).min(10.0) * 2.0;
+
+    // Special information score
+    score += special_info_score as f64;
+
+    // Length bonus (up to reasonable limit)
+    let length_bonus = (total_chars as f64 / 50.0).min(1.0) * 10.0;
+    score += length_bonus;
+
+    // Penalty for very short or generic names
+    if total_chars < 5 || word_count < 2 {
+        score *= 0.5;
+    }
+
+    score.min(100.0)
+}
+
+#[derive(Debug, Clone)]
+pub struct FilenameQuality {
+    pub japanese_chars: usize,
+    pub english_chars: usize,
+    pub total_chars: usize,
+    pub word_count: usize,
+    pub special_info_score: usize,
+    pub informativeness_score: f64,
+}
+
+/// Calculate quality score for file comparison (video metadata only)
 pub fn calculate_quality_score(metadata: &VideoMetadata) -> f64 {
     let mut score = 0.0;
-    
+
     // Resolution score (0-100)
     let resolution_score = match classify_resolution(metadata.width, metadata.height) {
         ResolutionClass::UHD4K => 100.0,
@@ -276,14 +392,14 @@ pub fn calculate_quality_score(metadata: &VideoMetadata) -> f64 {
         ResolutionClass::Unknown => 0.0,
     };
     score += resolution_score * 0.4; // 40% weight
-    
+
     // Codec score (0-100)
     let codec_score = metadata.video_codec
         .as_ref()
         .map(|c| classify_codec(c).quality_score() as f64 * 12.5) // Scale to 0-100
         .unwrap_or(0.0);
     score += codec_score * 0.3; // 30% weight
-    
+
     // Bitrate score (0-100, normalized)
     let bitrate_score = metadata.bitrate
         .map(|br| {
@@ -293,8 +409,26 @@ pub fn calculate_quality_score(metadata: &VideoMetadata) -> f64 {
         })
         .unwrap_or(50.0); // Default middle score if unknown
     score += bitrate_score * 0.3; // 30% weight
-    
+
     score
+}
+
+/// Calculate comprehensive quality score including filename informativeness
+pub fn calculate_comprehensive_quality_score(metadata: &VideoMetadata, file_path: &Path) -> f64 {
+    // Base video quality score (70% weight)
+    let video_quality = calculate_quality_score(metadata) * 0.7;
+
+    // Filename informativeness score (30% weight)
+    let filename_quality = analyze_filename_quality(file_path);
+    let filename_score = filename_quality.informativeness_score * 0.3;
+
+    debug!("Quality scores for {}: video={:.1}, filename={:.1}, total={:.1}",
+           file_path.display(),
+           video_quality / 0.7,
+           filename_score / 0.3,
+           video_quality + filename_score);
+
+    video_quality + filename_score
 }
 
 #[cfg(test)]
@@ -351,5 +485,62 @@ mod tests {
         assert_eq!(format_resolution(Some(1920), Some(1080)), "1920x1080");
         assert_eq!(format_resolution(None, None), "unknown");
         assert_eq!(format_resolution(Some(1920), None), "unknown");
+    }
+
+    #[test]
+    fn test_filename_quality_analysis() {
+        use std::path::PathBuf;
+
+        // Test Japanese filename with technical info
+        let japanese_file = PathBuf::from("アニメタイトル_第01話_1080p_H264_BluRay.mp4");
+        let japanese_quality = analyze_filename_quality(&japanese_file);
+        assert!(japanese_quality.japanese_chars > 0);
+        assert!(japanese_quality.informativeness_score > 50.0);
+        assert!(japanese_quality.special_info_score > 0);
+
+        // Test English filename with technical info
+        let english_file = PathBuf::from("Movie.Title.2023.1080p.BluRay.H265.DTS-HD.mp4");
+        let english_quality = analyze_filename_quality(&english_file);
+        assert!(english_quality.english_chars > 0);
+        assert!(english_quality.informativeness_score > 50.0);
+
+        // Test mixed language filename (should score highest)
+        let mixed_file = PathBuf::from("映画タイトル Movie Title 2023 1080p BluRay H264.mp4");
+        let mixed_quality = analyze_filename_quality(&mixed_file);
+        assert!(mixed_quality.japanese_chars > 0);
+        assert!(mixed_quality.english_chars > 0);
+        assert!(mixed_quality.informativeness_score > english_quality.informativeness_score);
+
+        // Test generic filename (should score low)
+        let generic_file = PathBuf::from("video1.mp4");
+        let generic_quality = analyze_filename_quality(&generic_file);
+        assert!(generic_quality.informativeness_score < 20.0);
+    }
+
+    #[test]
+    fn test_comprehensive_quality_scoring() {
+        use std::path::PathBuf;
+
+        let high_quality_metadata = VideoMetadata {
+            duration_seconds: 120.0,
+            width: Some(1920),
+            height: Some(1080),
+            video_codec: Some("h264".to_string()),
+            audio_codec: Some("aac".to_string()),
+            bitrate: Some(5_000_000),
+            has_audio: true,
+            format_name: Some("mp4".to_string()),
+        };
+
+        // Test with informative filename
+        let informative_path = PathBuf::from("映画タイトル Movie Title 2023 1080p BluRay H264.mp4");
+        let informative_score = calculate_comprehensive_quality_score(&high_quality_metadata, &informative_path);
+
+        // Test with generic filename
+        let generic_path = PathBuf::from("video.mp4");
+        let generic_score = calculate_comprehensive_quality_score(&high_quality_metadata, &generic_path);
+
+        // Informative filename should score higher
+        assert!(informative_score > generic_score);
     }
 }
