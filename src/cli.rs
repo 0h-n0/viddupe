@@ -129,6 +129,14 @@ pub struct CommonOptions {
     /// GPU acceleration type (auto, nvenc, qsv, amf, vaapi, videotoolbox, cpu)
     #[arg(long, default_value = "auto")]
     pub gpu_accel: String,
+
+    /// Minimum confidence threshold for duplicate detection (0.0-100.0)
+    #[arg(long, default_value = "85.0")]
+    pub confidence_threshold: f64,
+
+    /// Only process perfect matches (100% confidence)
+    #[arg(long)]
+    pub perfect_only: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum)]

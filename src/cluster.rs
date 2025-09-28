@@ -116,8 +116,29 @@ pub async fn find_duplicate_clusters(
     // Remove overlapping clusters and sort by confidence
     let unique_clusters = deduplicate_clusters(clusters);
 
-    info!("Found {} duplicate clusters", unique_clusters.len());
-    Ok(unique_clusters)
+    // Filter by confidence threshold
+    let min_confidence = if options.perfect_only {
+        100.0
+    } else {
+        options.confidence_threshold
+    };
+
+    let filtered_clusters: Vec<DuplicateCluster> = unique_clusters
+        .into_iter()
+        .filter(|cluster| {
+            let confidence_percent = cluster.confidence_score * 100.0;
+            confidence_percent >= min_confidence
+        })
+        .collect();
+
+    if options.perfect_only {
+        info!("Found {} perfect duplicate clusters (100% confidence)", filtered_clusters.len());
+    } else {
+        info!("Found {} duplicate clusters (>= {:.1}% confidence)",
+              filtered_clusters.len(), min_confidence);
+    }
+
+    Ok(filtered_clusters)
 }
 
 /// Group files by their coarse hashes for initial filtering
