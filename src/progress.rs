@@ -49,7 +49,7 @@ pub fn create_hash_progress(total: usize, hash_type: &str) -> ProgressBar {
             "{spinner:.magenta} [{elapsed_precise}] [{wide_bar:.magenta/purple}] {pos}/{len} hashes ({per_sec}) | ETA: {eta} | {msg}"
         )
         .unwrap()
-        .progress_chars("▓▒░")
+        .progress_chars("=>#")
     );
     
     pb.set_message(format!("Computing {} hashes...", hash_type));
@@ -78,7 +78,7 @@ pub fn create_chromaprint_progress(total: usize) -> ProgressBar {
             "{spinner:.blue} [{elapsed_precise}] [{wide_bar:.blue/cyan}] {pos}/{len} fingerprints | ETA: {eta} | {msg}"
         )
         .unwrap()
-        .progress_chars("♫♪♩")
+        .progress_chars("=>-")
     );
     
     pb.set_message("Computing audio fingerprints...");
@@ -97,7 +97,7 @@ pub fn create_cluster_progress(total: usize) -> ProgressBar {
             "{spinner:.green} [{elapsed_precise}] [{wide_bar:.green/yellow}] {pos}/{len} comparisons | ETA: {eta} | {msg}"
         )
         .unwrap()
-        .progress_chars("🔍🔎🔍")
+        .progress_chars("=>-")
     );
     
     pb.set_message("Finding duplicate clusters...");
@@ -116,7 +116,7 @@ pub fn create_deletion_progress(total: usize) -> ProgressBar {
             "{spinner:.red} [{elapsed_precise}] [{wide_bar:.red/yellow}] {pos}/{len} files | ETA: {eta} | {msg}"
         )
         .unwrap()
-        .progress_chars("🗑️📁🗑️")
+        .progress_chars("=>-")
     );
     
     pb.set_message("Deleting files...");
