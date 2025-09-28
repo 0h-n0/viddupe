@@ -174,6 +174,8 @@ impl ProgressTracker {
         let current_skipped = *self.skipped.lock().unwrap();
         drop(processed);
 
+        debug!("Progress update: {} processed, {} skipped, current: {}",
+               current_processed, current_skipped, filename);
         self.update_progress_bar(current_processed, current_skipped, Some(filename));
     }
 
@@ -262,8 +264,12 @@ async fn process_files_in_batches(
                     .unwrap_or("unknown")
                     .to_string();
 
+                debug!("Starting to process file: {}", filename);
                 match process_single_file_compute(&video_file, &scan_options, &common_options).await {
-                    Ok(result) => Some(result),
+                    Ok(result) => {
+                        debug!("Completed processing file: {}", filename);
+                        Some(result)
+                    },
                     Err(e) => {
                         warn!("File processing failed for {}: {}", filename, e);
                         None
@@ -277,25 +283,59 @@ async fn process_files_in_batches(
         // Collect results from parallel processing
         while let Some(result) = futures.next().await {
             if let Some(analysis_result) = result {
+                // Update progress immediately when file is processed
+                progress_tracker.update_processed(&analysis_result.filename);
                 batch_results.push(analysis_result);
 
                 // Store batch when it reaches optimal size
                 if batch_results.len() >= batch_size {
-                    processed_count += store_analysis_batch(db_conn, &mut batch_results, &progress_tracker)?;
+                    processed_count += store_analysis_batch_silent(db_conn, &mut batch_results)?;
                 }
             }
         }
 
         // Update progress after each chunk
         if !batch_results.is_empty() {
-            processed_count += store_analysis_batch(db_conn, &mut batch_results, &progress_tracker)?;
+            processed_count += store_analysis_batch_silent(db_conn, &mut batch_results)?;
         }
     }
 
     Ok(processed_count)
 }
 
-/// Store analysis results in batch for better database performance
+/// Store analysis results in batch for better database performance (silent - no progress updates)
+fn store_analysis_batch_silent(
+    db_conn: &rusqlite::Connection,
+    batch_results: &mut Vec<AnalysisResult>,
+) -> Result<usize> {
+    let mut stored_count = 0;
+
+    // Use database transaction for batch operations
+    let mut tx = db_conn.unchecked_transaction()?;
+
+    for result in batch_results.drain(..) {
+        match db::store_file_analysis_tx(
+            &mut tx,
+            &result.video_file,
+            &result.metadata,
+            &result.coarse_hashes,
+            result.phash_data.as_ref(),
+            result.chromaprint.as_deref(),
+        ) {
+            Ok(_) => {
+                stored_count += 1;
+            }
+            Err(e) => {
+                warn!("Failed to store analysis for {}: {}", result.filename, e);
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(stored_count)
+}
+
+/// Store analysis results in batch for better database performance (with progress updates)
 fn store_analysis_batch(
     db_conn: &rusqlite::Connection,
     batch_results: &mut Vec<AnalysisResult>,
