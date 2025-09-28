@@ -1,49 +1,70 @@
 use anyhow::{Result};
 use log::{debug, error, info, warn};
+use std::io::Write;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::{cli, cluster::DuplicateCluster, db, scan::VideoFile};
 
-/// Check availability of external tools
+/// Check availability of external tools with timeout and progress indication
 pub fn check_external_tools() -> Result<()> {
-    info!("Checking external tool dependencies...");
-    
-    // Check ffprobe (required)
-    if !is_command_available("ffprobe") {
-        error!("ffprobe not found in PATH");
-        print_ffmpeg_installation_help();
-        anyhow::bail!("Required dependency 'ffprobe' not found");
-    }
-    debug!("✓ ffprobe found");
+    println!("🔍 Checking external dependencies...");
 
-    // Check ffmpeg (required)
-    if !is_command_available("ffmpeg") {
-        error!("ffmpeg not found in PATH");
-        print_ffmpeg_installation_help();
-        anyhow::bail!("Required dependency 'ffmpeg' not found");
-    }
-    debug!("✓ ffmpeg found");
+    // Check required tools in parallel with timeout
+    let required_tools = ["ffprobe", "ffmpeg"];
+    let mut missing_tools = Vec::new();
 
-    // Check fpcalc (optional)
-    if is_command_available("fpcalc") {
+    for tool in &required_tools {
+        print!("  Checking {}... ", tool);
+        std::io::stdout().flush().unwrap();
+
+        if is_command_available_fast(tool) {
+            println!("✓");
+            debug!("✓ {} found", tool);
+        } else {
+            println!("✗");
+            missing_tools.push(*tool);
+        }
+    }
+
+    // If any required tools are missing, show help and exit
+    if !missing_tools.is_empty() {
+        error!("Required dependencies not found: {}", missing_tools.join(", "));
+        print_ffmpeg_installation_help();
+        anyhow::bail!("Required dependencies missing: {}", missing_tools.join(", "));
+    }
+
+    // Check optional tools
+    print!("  Checking fpcalc (optional)... ");
+    std::io::stdout().flush().unwrap();
+
+    if is_command_available_fast("fpcalc") {
+        println!("✓ (audio fingerprinting enabled)");
         info!("✓ fpcalc found - audio fingerprinting enabled");
     } else {
-        warn!("fpcalc not found - audio fingerprinting will be skipped");
-        warn!("Install chromaprint for enhanced duplicate detection accuracy");
-        print_fpcalc_installation_help();
+        println!("- (audio fingerprinting disabled)");
+        debug!("fpcalc not found - audio fingerprinting will be skipped");
     }
 
-    info!("External tool check completed");
+    println!("✅ Dependency check completed");
     Ok(())
 }
 
 fn is_command_available(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--help")
-        .output()
-        .map(|output| output.status.success())
+    is_command_available_fast(cmd)
+}
+
+fn is_command_available_fast(cmd: &str) -> bool {
+    // Use "which" on Unix-like systems or "where" on Windows for faster checking
+    let check_cmd = if cfg!(target_os = "windows") { "where" } else { "which" };
+
+    Command::new(check_cmd)
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
         .unwrap_or(false)
 }
 
@@ -203,7 +224,7 @@ impl ProgressTracker {
     }
 }
 
-/// Process files in batches with optimized sequential processing
+/// Process files in parallel batches with proper concurrency control
 async fn process_files_in_batches(
     files: Vec<VideoFile>,
     db_conn: &rusqlite::Connection,
@@ -212,34 +233,63 @@ async fn process_files_in_batches(
     progress_tracker: Arc<ProgressTracker>,
     batch_size: usize,
 ) -> Result<usize> {
+    use tokio::sync::Semaphore;
+    use futures::stream::{StreamExt, FuturesUnordered};
+
     let mut processed_count = 0;
     let mut batch_results = Vec::new();
 
-    // Process files sequentially but batch database operations
-    for video_file in files {
-        let filename = video_file.path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+    // Create semaphore to limit concurrent processing
+    let semaphore = Arc::new(Semaphore::new(common_options.jobs));
 
-        match process_single_file_compute(&video_file, scan_options, common_options).await {
-            Ok(analysis_result) => {
+    // Process files in chunks to avoid overwhelming the system
+    let chunk_size = (common_options.jobs * 4).max(batch_size);
+
+    for chunk in files.chunks(chunk_size) {
+        let mut futures = FuturesUnordered::new();
+
+        // Create futures for parallel processing
+        for video_file in chunk {
+            let video_file = video_file.clone();
+            let scan_options = scan_options.clone();
+            let common_options = common_options.clone();
+            let semaphore = semaphore.clone();
+
+            let future = async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                let filename = video_file.path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                match process_single_file_compute(&video_file, &scan_options, &common_options).await {
+                    Ok(result) => Some(result),
+                    Err(e) => {
+                        warn!("File processing failed for {}: {}", filename, e);
+                        None
+                    }
+                }
+            };
+
+            futures.push(future);
+        }
+
+        // Collect results from parallel processing
+        while let Some(result) = futures.next().await {
+            if let Some(analysis_result) = result {
                 batch_results.push(analysis_result);
 
-                // Process batch when it reaches optimal size
+                // Store batch when it reaches optimal size
                 if batch_results.len() >= batch_size {
                     processed_count += store_analysis_batch(db_conn, &mut batch_results, &progress_tracker)?;
                 }
             }
-            Err(e) => {
-                warn!("File processing failed for {}: {}", filename, e);
-            }
         }
-    }
 
-    // Process remaining results
-    if !batch_results.is_empty() {
-        processed_count += store_analysis_batch(db_conn, &mut batch_results, &progress_tracker)?;
+        // Update progress after each chunk
+        if !batch_results.is_empty() {
+            processed_count += store_analysis_batch(db_conn, &mut batch_results, &progress_tracker)?;
+        }
     }
 
     Ok(processed_count)

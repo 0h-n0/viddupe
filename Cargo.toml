@@ -28,6 +28,7 @@ ignore = "0.4"
 # Concurrency and parallelism
 rayon = "1.8"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "fs", "process", "io-util", "sync"] }
+futures = "0.3"
 
 # Progress indication
 indicatif = { version = "0.17", features = ["rayon"] }
