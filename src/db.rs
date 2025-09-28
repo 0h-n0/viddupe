@@ -66,17 +66,20 @@ pub async fn open_database(db_path: &Path) -> Result<Connection> {
 }
 
 fn configure_database(conn: &Connection) -> Result<()> {
-    // Enable WAL mode for better concurrency
+    // Enable WAL mode for better concurrency and performance optimizations
     conn.execute_batch("
         PRAGMA journal_mode = WAL;
-        PRAGMA cache_size = -64000;
+        PRAGMA cache_size = -128000;
         PRAGMA foreign_keys = ON;
         PRAGMA synchronous = NORMAL;
         PRAGMA temp_store = MEMORY;
-        PRAGMA mmap_size = 268435456;
+        PRAGMA mmap_size = 536870912;
+        PRAGMA page_size = 8192;
+        PRAGMA wal_autocheckpoint = 1000;
+        PRAGMA optimize = 0x10002;
     ")?;
-    
-    debug!("Database configured with performance optimizations");
+
+    debug!("Database configured with enhanced performance optimizations");
     Ok(())
 }
 
@@ -292,6 +295,74 @@ pub fn store_file_analysis(
     tx.commit()?;
     
     debug!("Stored analysis for file ID {}: {}", file_id, video_file.path.display());
+    Ok(file_id)
+}
+
+/// Store file analysis results using an existing transaction (for batch operations)
+pub fn store_file_analysis_tx(
+    tx: &mut Transaction,
+    video_file: &VideoFile,
+    metadata: &VideoMetadata,
+    coarse_hashes: &CoarseHashes,
+    phash_data: Option<&PerceptualHashData>,
+    chromaprint: Option<&str>,
+) -> Result<i64> {
+    let path_str = crate::util::path_to_string(&video_file.path);
+    let now = Utc::now().timestamp();
+
+    // Serialize phash data
+    let (phash_avg, phash_individual, phash_frame_count) = match phash_data {
+        Some(data) => (
+            Some(data.average_hash.clone()),
+            Some(serde_json::to_string(&data.individual_hashes)?),
+            Some(data.frame_count as i32),
+        ),
+        None => (None, None, None),
+    };
+
+    tx.execute(
+        r#"
+        INSERT OR REPLACE INTO files (
+            path, size, modified, duration_seconds, width, height,
+            video_codec, audio_codec, bitrate, has_audio, format_name,
+            head_hash, tail_hash, phash_average, phash_individual, phash_frame_count,
+            chromaprint, updated_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18
+        )
+        "#,
+        params![
+            path_str,
+            video_file.size as i64,
+            video_file.modified.timestamp(),
+            metadata.duration_seconds,
+            metadata.width.map(|w| w as i32),
+            metadata.height.map(|h| h as i32),
+            metadata.video_codec,
+            metadata.audio_codec,
+            metadata.bitrate.map(|b| b as i64),
+            metadata.has_audio,
+            metadata.format_name,
+            coarse_hashes.head_hash,
+            coarse_hashes.tail_hash,
+            phash_avg,
+            phash_individual,
+            phash_frame_count,
+            chromaprint,
+            now,
+        ],
+    )?;
+
+    let file_id = tx.last_insert_rowid();
+
+    // Log successful analysis
+    tx.execute(
+        "INSERT INTO analysis_log (file_id, analysis_type, success) VALUES (?1, 'complete', 1)",
+        params![file_id],
+    )?;
+
+    debug!("Stored analysis for file ID {} in transaction: {}", file_id, video_file.path.display());
     Ok(file_id)
 }
 

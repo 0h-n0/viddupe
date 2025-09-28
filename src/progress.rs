@@ -8,7 +8,7 @@ pub fn create_scan_progress(total: usize) -> ProgressBar {
     
     pb.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} files ({per_sec}) | {msg}"
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} files ({per_sec}) | ETA: {eta} | {msg}"
         )
         .unwrap()
         .progress_chars("#>-")
@@ -46,7 +46,7 @@ pub fn create_hash_progress(total: usize, hash_type: &str) -> ProgressBar {
     
     pb.set_style(
         ProgressStyle::with_template(
-            "{spinner:.magenta} [{elapsed_precise}] [{wide_bar:.magenta/purple}] {pos}/{len} hashes ({per_sec}) | {msg}"
+            "{spinner:.magenta} [{elapsed_precise}] [{wide_bar:.magenta/purple}] {pos}/{len} hashes ({per_sec}) | ETA: {eta} | {msg}"
         )
         .unwrap()
         .progress_chars("▓▒░")
@@ -94,7 +94,7 @@ pub fn create_cluster_progress(total: usize) -> ProgressBar {
     
     pb.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.green/yellow}] {pos}/{len} comparisons | {msg}"
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.green/yellow}] {pos}/{len} comparisons | ETA: {eta} | {msg}"
         )
         .unwrap()
         .progress_chars("🔍🔎🔍")
@@ -113,7 +113,7 @@ pub fn create_deletion_progress(total: usize) -> ProgressBar {
     
     pb.set_style(
         ProgressStyle::with_template(
-            "{spinner:.red} [{elapsed_precise}] [{wide_bar:.red/yellow}] {pos}/{len} files | {msg}"
+            "{spinner:.red} [{elapsed_precise}] [{wide_bar:.red/yellow}] {pos}/{len} files | ETA: {eta} | {msg}"
         )
         .unwrap()
         .progress_chars("🗑️📁🗑️")

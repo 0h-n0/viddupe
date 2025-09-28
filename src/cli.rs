@@ -77,7 +77,7 @@ pub enum Commands {
     },
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 pub struct ScanOptions {
     /// Video file extensions to process
     #[arg(long, default_value = "mp4")]
@@ -100,7 +100,7 @@ pub struct ScanOptions {
     pub head_tail_mib: u32,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 pub struct CommonOptions {
     /// Database file path
     #[arg(long, default_value = "viddupe.db")]

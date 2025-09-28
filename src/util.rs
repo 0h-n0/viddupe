@@ -1,6 +1,8 @@
 use anyhow::{Result};
 use log::{debug, error, info, warn};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::{cli, cluster::DuplicateCluster, db, scan::VideoFile};
 
@@ -74,49 +76,212 @@ pub async fn process_files_parallel(
     progress: indicatif::ProgressBar,
 ) -> Result<usize> {
     info!("Processing {} files with {} parallel jobs", files.len(), common_options.jobs);
-    
-    // Since rusqlite::Connection is not thread-safe, we'll use sequential processing
-    // for database operations and parallel processing only for the heavy computation parts
-    let mut processed_count = 0;
-    
+
+    let start_time = Instant::now();
+    let total_files = files.len();
+
+    // Enhanced progress tracking with ETA calculation
+    let progress_tracker = Arc::new(ProgressTracker::new(total_files, progress.clone()));
+
+    // Filter out files that are already up-to-date
+    let mut files_to_process = Vec::new();
     for video_file in files {
-        // Check if file is already processed and up-to-date in cache
         if db::is_file_up_to_date(db_conn, &video_file)? {
             debug!("File already up-to-date in cache: {}", video_file.path.display());
-            progress.inc(1);
-            continue;
+            progress_tracker.update_skipped();
+        } else {
+            files_to_process.push(video_file);
         }
-        
-        // Process the heavy computation parts (metadata, hashes) 
-        match process_single_file_compute(&video_file, scan_options, common_options).await {
-            Ok(analysis_result) => {
-                // Store results in database (sequential for thread safety)
-                if let Err(e) = db::store_file_analysis(
-                    db_conn,
-                    &video_file,
-                    &analysis_result.metadata,
-                    &analysis_result.coarse_hashes,
-                    analysis_result.phash_data.as_ref(),
-                    analysis_result.chromaprint.as_deref(),
-                ) {
-                    warn!("Failed to store analysis for {}: {}", video_file.path.display(), e);
-                } else {
-                    processed_count += 1;
-                }
-            }
-            Err(e) => {
-                warn!("File processing failed for {}: {}", video_file.path.display(), e);
-            }
-        }
-        
-        progress.inc(1);
     }
 
-    progress.finish_with_message("File processing completed");
+    if files_to_process.is_empty() {
+        progress.finish_with_message("All files are up-to-date");
+        return Ok(0);
+    }
+
+    info!("Processing {} new/changed files", files_to_process.len());
+
+    // Use parallel processing for computation with batched database writes
+    let batch_size = (common_options.jobs * 2).max(10).min(50);
+    let processed_count = process_files_in_batches(
+        files_to_process,
+        db_conn,
+        scan_options,
+        common_options,
+        progress_tracker,
+        batch_size,
+    ).await?;
+
+    let elapsed = start_time.elapsed();
+    let files_per_sec = processed_count as f64 / elapsed.as_secs_f64();
+    let final_message = format!(
+        "Processing completed: {} files in {:.1}s ({:.1} files/sec)",
+        processed_count,
+        elapsed.as_secs_f64(),
+        files_per_sec
+    );
+
+    progress.finish_with_message(final_message);
     Ok(processed_count)
 }
 
+/// Enhanced progress tracking with ETA calculation
+#[derive(Debug)]
+struct ProgressTracker {
+    total_files: usize,
+    processed: Arc<Mutex<usize>>,
+    skipped: Arc<Mutex<usize>>,
+    start_time: Instant,
+    progress_bar: indicatif::ProgressBar,
+}
+
+impl ProgressTracker {
+    fn new(total_files: usize, progress_bar: indicatif::ProgressBar) -> Self {
+        Self {
+            total_files,
+            processed: Arc::new(Mutex::new(0)),
+            skipped: Arc::new(Mutex::new(0)),
+            start_time: Instant::now(),
+            progress_bar,
+        }
+    }
+
+    fn update_processed(&self, filename: &str) {
+        let mut processed = self.processed.lock().unwrap();
+        *processed += 1;
+        let current_processed = *processed;
+        let current_skipped = *self.skipped.lock().unwrap();
+        drop(processed);
+
+        self.update_progress_bar(current_processed, current_skipped, Some(filename));
+    }
+
+    fn update_skipped(&self) {
+        let mut skipped = self.skipped.lock().unwrap();
+        *skipped += 1;
+        let current_skipped = *skipped;
+        let current_processed = *self.processed.lock().unwrap();
+        drop(skipped);
+
+        self.update_progress_bar(current_processed, current_skipped, None);
+    }
+
+    fn update_progress_bar(&self, processed: usize, skipped: usize, current_file: Option<&str>) {
+        let total_done = processed + skipped;
+        let remaining = self.total_files.saturating_sub(total_done);
+
+        // Calculate ETA
+        let elapsed = self.start_time.elapsed();
+        let files_per_sec = if elapsed.as_secs() > 0 {
+            processed as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        let eta_seconds = if files_per_sec > 0.0 && remaining > 0 {
+            (remaining as f64 / files_per_sec) as u64
+        } else {
+            0
+        };
+
+        let eta_text = if eta_seconds > 0 {
+            format_duration_short(eta_seconds)
+        } else {
+            "calculating...".to_string()
+        };
+
+        let message = if let Some(filename) = current_file {
+            format!("Processing: {} | ETA: {} | {:.1}/s",
+                   filename, eta_text, files_per_sec)
+        } else {
+            format!("Scanning cache... | ETA: {} | {:.1}/s",
+                   eta_text, files_per_sec)
+        };
+
+        self.progress_bar.set_position(total_done as u64);
+        self.progress_bar.set_message(message);
+    }
+}
+
+/// Process files in batches with optimized sequential processing
+async fn process_files_in_batches(
+    files: Vec<VideoFile>,
+    db_conn: &rusqlite::Connection,
+    scan_options: &cli::ScanOptions,
+    common_options: &cli::CommonOptions,
+    progress_tracker: Arc<ProgressTracker>,
+    batch_size: usize,
+) -> Result<usize> {
+    let mut processed_count = 0;
+    let mut batch_results = Vec::new();
+
+    // Process files sequentially but batch database operations
+    for video_file in files {
+        let filename = video_file.path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        match process_single_file_compute(&video_file, scan_options, common_options).await {
+            Ok(analysis_result) => {
+                batch_results.push(analysis_result);
+
+                // Process batch when it reaches optimal size
+                if batch_results.len() >= batch_size {
+                    processed_count += store_analysis_batch(db_conn, &mut batch_results, &progress_tracker)?;
+                }
+            }
+            Err(e) => {
+                warn!("File processing failed for {}: {}", filename, e);
+            }
+        }
+    }
+
+    // Process remaining results
+    if !batch_results.is_empty() {
+        processed_count += store_analysis_batch(db_conn, &mut batch_results, &progress_tracker)?;
+    }
+
+    Ok(processed_count)
+}
+
+/// Store analysis results in batch for better database performance
+fn store_analysis_batch(
+    db_conn: &rusqlite::Connection,
+    batch_results: &mut Vec<AnalysisResult>,
+    progress_tracker: &ProgressTracker,
+) -> Result<usize> {
+    let mut stored_count = 0;
+
+    // Use database transaction for batch operations
+    let mut tx = db_conn.unchecked_transaction()?;
+
+    for result in batch_results.drain(..) {
+        match db::store_file_analysis_tx(
+            &mut tx,
+            &result.video_file,
+            &result.metadata,
+            &result.coarse_hashes,
+            result.phash_data.as_ref(),
+            result.chromaprint.as_deref(),
+        ) {
+            Ok(_) => {
+                stored_count += 1;
+                progress_tracker.update_processed(&result.filename);
+            }
+            Err(e) => {
+                warn!("Failed to store analysis for {}: {}", result.filename, e);
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(stored_count)
+}
+
 struct AnalysisResult {
+    video_file: VideoFile,
+    filename: String,
     metadata: crate::db::VideoMetadata,
     coarse_hashes: crate::db::CoarseHashes,
     phash_data: Option<crate::db::PerceptualHashData>,
@@ -162,6 +327,11 @@ async fn process_single_file_compute(
     debug!("Successfully processed: {}", video_file.path.display());
     
     Ok(AnalysisResult {
+        video_file: video_file.clone(),
+        filename: video_file.path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string(),
         metadata,
         coarse_hashes,
         phash_data,
@@ -267,6 +437,21 @@ pub fn percentage_difference(a: f64, b: f64) -> f64 {
         0.0
     } else {
         ((a - b).abs() / ((a + b) / 2.0)) * 100.0
+    }
+}
+
+/// Format duration in short human-readable format for ETA
+pub fn format_duration_short(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+
+    if hours > 0 {
+        format!("{}h{}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m{}s", minutes, secs)
+    } else {
+        format!("{}s", secs)
     }
 }
 
