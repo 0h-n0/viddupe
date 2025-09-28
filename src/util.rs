@@ -7,6 +7,110 @@ use std::time::Instant;
 
 use crate::{cli, cluster::DuplicateCluster, db, scan::VideoFile};
 
+#[derive(Debug, Clone)]
+pub struct GpuAccelConfig {
+    pub hwaccel: Option<String>,
+    pub decoder: Option<String>,
+    pub encoder: Option<String>,
+    pub extra_args: Vec<String>,
+}
+
+impl GpuAccelConfig {
+    pub fn from_user_selection(selection: &str) -> Self {
+        match selection.to_lowercase().as_str() {
+            "nvenc" => Self::nvenc(),
+            "qsv" => Self::qsv(),
+            "amf" => Self::amf(),
+            "vaapi" => Self::vaapi(),
+            "videotoolbox" => Self::videotoolbox(),
+            "cpu" => Self::cpu_only(),
+            "auto" => Self::auto_detect(),
+            _ => {
+                warn!("Unknown GPU acceleration type: {}, falling back to auto", selection);
+                Self::auto_detect()
+            }
+        }
+    }
+
+    fn nvenc() -> Self {
+        Self {
+            hwaccel: Some("cuda".to_string()),
+            decoder: Some("h264_cuvid".to_string()),
+            encoder: Some("h264_nvenc".to_string()),
+            extra_args: vec!["-preset".to_string(), "fast".to_string()],
+        }
+    }
+
+    fn qsv() -> Self {
+        Self {
+            hwaccel: Some("qsv".to_string()),
+            decoder: Some("h264_qsv".to_string()),
+            encoder: Some("h264_qsv".to_string()),
+            extra_args: vec!["-preset".to_string(), "fast".to_string()],
+        }
+    }
+
+    fn amf() -> Self {
+        Self {
+            hwaccel: Some("d3d11va".to_string()),
+            decoder: None,
+            encoder: Some("h264_amf".to_string()),
+            extra_args: vec!["-usage".to_string(), "transcoding".to_string()],
+        }
+    }
+
+    fn vaapi() -> Self {
+        Self {
+            hwaccel: Some("vaapi".to_string()),
+            decoder: None,
+            encoder: Some("h264_vaapi".to_string()),
+            extra_args: vec!["-vaapi_device".to_string(), "/dev/dri/renderD128".to_string()],
+        }
+    }
+
+    fn videotoolbox() -> Self {
+        Self {
+            hwaccel: Some("videotoolbox".to_string()),
+            decoder: None,
+            encoder: Some("h264_videotoolbox".to_string()),
+            extra_args: vec![],
+        }
+    }
+
+    fn cpu_only() -> Self {
+        Self {
+            hwaccel: None,
+            decoder: None,
+            encoder: None,
+            extra_args: vec![],
+        }
+    }
+
+    fn auto_detect() -> Self {
+        let gpu_support = detect_gpu_acceleration();
+
+        if gpu_support.contains(&"NVENC".to_string()) {
+            info!("Auto-detected NVIDIA GPU, using NVENC acceleration");
+            Self::nvenc()
+        } else if gpu_support.contains(&"QSV".to_string()) {
+            info!("Auto-detected Intel GPU, using Quick Sync Video acceleration");
+            Self::qsv()
+        } else if gpu_support.contains(&"AMF".to_string()) {
+            info!("Auto-detected AMD GPU, using AMF acceleration");
+            Self::amf()
+        } else if gpu_support.contains(&"VA-API".to_string()) {
+            info!("Auto-detected VA-API support, using VA-API acceleration");
+            Self::vaapi()
+        } else if gpu_support.contains(&"VideoToolbox".to_string()) {
+            info!("Auto-detected VideoToolbox support, using VideoToolbox acceleration");
+            Self::videotoolbox()
+        } else {
+            info!("No GPU acceleration detected, using CPU only");
+            Self::cpu_only()
+        }
+    }
+}
+
 /// Check availability of external tools with timeout and progress indication
 pub fn check_external_tools() -> Result<()> {
     println!("🔍 Checking external dependencies...");
@@ -47,6 +151,19 @@ pub fn check_external_tools() -> Result<()> {
         debug!("fpcalc not found - audio fingerprinting will be skipped");
     }
 
+    // Check GPU acceleration support
+    let gpu_support = detect_gpu_acceleration();
+    print!("  Checking GPU acceleration... ");
+    std::io::stdout().flush().unwrap();
+
+    if !gpu_support.is_empty() {
+        println!("✓ ({})", gpu_support.join(", "));
+        info!("✓ GPU acceleration available: {}", gpu_support.join(", "));
+    } else {
+        println!("- (CPU only)");
+        debug!("No GPU acceleration detected");
+    }
+
     println!("✅ Dependency check completed");
     Ok(())
 }
@@ -65,6 +182,56 @@ fn is_command_available_fast(cmd: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Detect available GPU acceleration options for ffmpeg
+fn detect_gpu_acceleration() -> Vec<String> {
+    let mut acceleration_types = Vec::new();
+
+    // Check for NVIDIA GPU support (NVENC/NVDEC)
+    if check_ffmpeg_encoder("h264_nvenc") {
+        acceleration_types.push("NVENC".to_string());
+    }
+
+    // Check for Intel GPU support (Quick Sync Video)
+    if check_ffmpeg_encoder("h264_qsv") {
+        acceleration_types.push("QSV".to_string());
+    }
+
+    // Check for AMD GPU support (AMF)
+    if check_ffmpeg_encoder("h264_amf") {
+        acceleration_types.push("AMF".to_string());
+    }
+
+    // Check for VA-API support (Linux)
+    if cfg!(target_os = "linux") && check_ffmpeg_encoder("h264_vaapi") {
+        acceleration_types.push("VA-API".to_string());
+    }
+
+    // Check for VideoToolbox support (macOS)
+    if cfg!(target_os = "macos") && check_ffmpeg_encoder("h264_videotoolbox") {
+        acceleration_types.push("VideoToolbox".to_string());
+    }
+
+    acceleration_types
+}
+
+/// Check if ffmpeg supports a specific encoder
+fn check_ffmpeg_encoder(encoder: &str) -> bool {
+    Command::new("ffmpeg")
+        .args(["-hide_banner", "-encoders"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|output| {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout.contains(encoder)
+            } else {
+                false
+            }
+        })
         .unwrap_or(false)
 }
 
@@ -382,25 +549,29 @@ struct AnalysisResult {
 async fn process_single_file_compute(
     video_file: &VideoFile,
     scan_options: &cli::ScanOptions,
-    _common_options: &cli::CommonOptions,
+    common_options: &cli::CommonOptions,
 ) -> Result<AnalysisResult> {
     debug!("Processing file: {}", video_file.path.display());
-    
+
+    // Initialize GPU acceleration config
+    let gpu_config = GpuAccelConfig::from_user_selection(&common_options.gpu_accel);
+
     // Stage 0: Extract metadata
     let metadata = crate::meta::extract_metadata(&video_file.path).await?;
-    
+
     // Stage 1: Compute coarse hashes (head/tail)
     let coarse_hashes = crate::coarse::compute_coarse_hashes(
-        &video_file.path, 
+        &video_file.path,
         scan_options.head_tail_mib as usize * 1024 * 1024
     ).await?;
-    
+
     // Stage 2: Compute perceptual hashes if video is substantial enough
     let phash_data = if metadata.duration_seconds > 5.0 {
-        Some(crate::phash::compute_perceptual_hashes(
+        Some(crate::phash::compute_perceptual_hashes_with_gpu(
             &video_file.path,
             scan_options.frame_samples,
             metadata.duration_seconds,
+            Some(&gpu_config),
         ).await?)
     } else {
         debug!("Skipping pHash for short video: {}", video_file.path.display());

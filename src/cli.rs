@@ -125,6 +125,10 @@ pub struct CommonOptions {
     /// Minimum file size in MB to process
     #[arg(long, default_value = "1")]
     pub min_size_mb: u64,
+
+    /// GPU acceleration type (auto, nvenc, qsv, amf, vaapi, videotoolbox, cpu)
+    #[arg(long, default_value = "auto")]
+    pub gpu_accel: String,
 }
 
 #[derive(Clone, Debug, ValueEnum)]

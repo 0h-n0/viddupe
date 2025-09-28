@@ -6,6 +6,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use crate::db::PerceptualHashData;
+use crate::util::GpuAccelConfig;
 
 /// Extract frames from video and compute perceptual hashes
 pub async fn compute_perceptual_hashes(
@@ -13,10 +14,20 @@ pub async fn compute_perceptual_hashes(
     frame_count: u32,
     duration_seconds: f64,
 ) -> Result<PerceptualHashData> {
+    compute_perceptual_hashes_with_gpu(video_path, frame_count, duration_seconds, None).await
+}
+
+/// Extract frames from video and compute perceptual hashes with GPU acceleration
+pub async fn compute_perceptual_hashes_with_gpu(
+    video_path: &Path,
+    frame_count: u32,
+    duration_seconds: f64,
+    gpu_config: Option<&GpuAccelConfig>,
+) -> Result<PerceptualHashData> {
     debug!("Computing perceptual hashes for {} frames from: {}", frame_count, video_path.display());
-    
+
     // Extract frames at evenly spaced intervals
-    let frame_hashes = extract_and_hash_frames(video_path, frame_count, duration_seconds).await?;
+    let frame_hashes = extract_and_hash_frames(video_path, frame_count, duration_seconds, gpu_config).await?;
     
     if frame_hashes.is_empty() {
         anyhow::bail!("No frames could be extracted from video: {}", video_path.display());
@@ -41,6 +52,7 @@ async fn extract_and_hash_frames(
     video_path: &Path,
     target_frame_count: u32,
     duration_seconds: f64,
+    gpu_config: Option<&GpuAccelConfig>,
 ) -> Result<Vec<Vec<u8>>> {
     // Calculate frame extraction intervals (skip first and last 5% to avoid intro/credits)
     let start_time = duration_seconds * 0.05;
@@ -59,7 +71,7 @@ async fn extract_and_hash_frames(
     for i in 0..target_frame_count {
         let timestamp = start_time + (i as f64 * interval);
         
-        match extract_single_frame(video_path, timestamp).await {
+        match extract_single_frame(video_path, timestamp, gpu_config).await {
             Ok(Some(image)) => {
                 // Compute perceptual hash using difference hash (dHash)
                 let img_hash_image = ImgHashDynamicImage::from(image.clone());
@@ -81,19 +93,46 @@ async fn extract_and_hash_frames(
 }
 
 /// Extract a single frame from video at specified timestamp
-async fn extract_single_frame(video_path: &Path, timestamp: f64) -> Result<Option<image::DynamicImage>> {
-    let output = Command::new("ffmpeg")
-        .args([
-            "-v", "quiet",                    // Suppress verbose output
-            "-ss", &timestamp.to_string(),    // Seek to timestamp
-            "-i", video_path.to_str().context("Invalid path encoding")?,
-            "-vframes", "1",                  // Extract 1 frame
-            "-q:v", "2",                      // High quality
-            "-vf", "scale=256:256",           // Resize for consistent hashing
-            "-f", "image2pipe",               // Output to pipe
-            "-vcodec", "png",                 // PNG format
-            "-",                              // Output to stdout
-        ])
+async fn extract_single_frame(
+    video_path: &Path,
+    timestamp: f64,
+    gpu_config: Option<&GpuAccelConfig>
+) -> Result<Option<image::DynamicImage>> {
+    let mut cmd = Command::new("ffmpeg");
+
+    // Add GPU acceleration arguments if available
+    if let Some(config) = gpu_config {
+        if let Some(hwaccel) = &config.hwaccel {
+            cmd.args(["-hwaccel", hwaccel]);
+        }
+
+        // Add extra GPU-specific arguments
+        for arg in &config.extra_args {
+            cmd.arg(arg);
+        }
+    }
+
+    cmd.args([
+        "-v", "quiet",                    // Suppress verbose output
+        "-ss", &timestamp.to_string(),    // Seek to timestamp
+    ]);
+
+    // Add input file
+    cmd.args([
+        "-i", video_path.to_str().context("Invalid path encoding")?,
+    ]);
+
+    // Configure frame extraction
+    cmd.args([
+        "-vframes", "1",                  // Extract 1 frame
+        "-q:v", "2",                      // High quality
+        "-vf", "scale=256:256",           // Resize for consistent hashing
+        "-f", "image2pipe",               // Output to pipe
+        "-vcodec", "png",                 // PNG format
+        "-",                              // Output to stdout
+    ]);
+
+    let output = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
