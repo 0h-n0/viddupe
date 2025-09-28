@@ -220,6 +220,7 @@ pub async fn execute_deletions(
     let progress = progress::create_deletion_progress(plan.files_to_delete.len());
     let mut success_count = 0;
     let mut error_count = 0;
+    let mut successfully_deleted_ids = Vec::new();
 
     // Create deletion log
     let log_path = "viddupe_deletions.csv";
@@ -237,6 +238,7 @@ pub async fn execute_deletions(
         let (action, status) = match result {
             Ok(()) => {
                 success_count += 1;
+                successfully_deleted_ids.push(target.file.id);
                 (if hard_delete { "hard_delete" } else { "trash" }, "success")
             }
             Err(ref e) => {
@@ -270,12 +272,34 @@ pub async fn execute_deletions(
         info!("Deletion log written to: {}", log_path);
     }
 
+    // Update database - remove successfully deleted files
+    if !successfully_deleted_ids.is_empty() {
+        match crate::db::open_database(db_path).await {
+            Ok(conn) => {
+                match crate::db::remove_files_from_db(&conn, &successfully_deleted_ids) {
+                    Ok(removed_count) => {
+                        info!("Updated database: removed {} file records", removed_count);
+                    }
+                    Err(e) => {
+                        warn!("Failed to update database: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to open database for cleanup: {}", e);
+            }
+        }
+    }
+
     println!("\n✅ Deletion Results:");
     println!("  Successful: {}", success_count);
     if error_count > 0 {
         println!("  ❌ Failed: {}", error_count);
     }
     println!("  📄 Log saved to: {}", log_path);
+    if !successfully_deleted_ids.is_empty() {
+        println!("  🗄️  Database updated: {} records removed", successfully_deleted_ids.len());
+    }
 
     Ok(())
 }

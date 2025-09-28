@@ -13,7 +13,7 @@ mod util;
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands};
-use log::{info, warn, error};
+use log::{debug, info, warn, error};
 use std::process;
 use tokio::runtime::Runtime;
 
@@ -133,8 +133,30 @@ async fn execute_dupes(
     info!("Analyzing duplicates in: {}", root.display());
     
     let db_conn = db::open_database(&common_options.db).await?;
-    let clusters = cluster::find_duplicate_clusters(&db_conn, common_options).await?;
-    
+    let mut clusters = cluster::find_duplicate_clusters(&db_conn, common_options).await?;
+
+    // Filter out files that no longer exist and remove empty clusters
+    let mut files_to_remove = Vec::new();
+    clusters.retain_mut(|cluster| {
+        cluster.files.retain(|file| {
+            let exists = file.path.exists();
+            if !exists {
+                files_to_remove.push(file.id);
+                debug!("File no longer exists: {}", file.path.display());
+            }
+            exists
+        });
+        cluster.files.len() >= 2 // Keep clusters with at least 2 files
+    });
+
+    // Clean up database if any missing files were found
+    if !files_to_remove.is_empty() {
+        info!("Cleaning up {} missing files from database", files_to_remove.len());
+        if let Err(e) = db::remove_files_from_db(&db_conn, &files_to_remove) {
+            warn!("Failed to clean up missing files: {}", e);
+        }
+    }
+
     if clusters.is_empty() {
         println!("No duplicate clusters found!");
         return Ok(());

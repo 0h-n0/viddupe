@@ -428,6 +428,31 @@ pub fn get_all_files(conn: &Connection) -> Result<Vec<FileRecord>> {
     Ok(files)
 }
 
+/// Remove specific files from database by file ID
+pub fn remove_files_from_db(conn: &Connection, file_ids: &[i64]) -> Result<usize> {
+    if file_ids.is_empty() {
+        return Ok(0);
+    }
+
+    info!("Removing {} files from database", file_ids.len());
+
+    let tx = conn.unchecked_transaction()?;
+    let mut removed_count = 0;
+
+    for &file_id in file_ids {
+        let rows_affected = tx.execute("DELETE FROM files WHERE id = ?", params![file_id])?;
+        if rows_affected > 0 {
+            removed_count += 1;
+            debug!("Removed file with ID {} from database", file_id);
+        }
+    }
+
+    tx.commit()?;
+
+    info!("Successfully removed {} files from database", removed_count);
+    Ok(removed_count)
+}
+
 /// Remove files that no longer exist on disk
 pub async fn cleanup_missing_files(conn: &Connection) -> Result<usize> {
     info!("Cleaning up missing files from database...");

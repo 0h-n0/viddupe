@@ -340,13 +340,18 @@ fn calculate_informativeness_score(
 ) -> f64 {
     let mut score = 0.0;
 
-    // Base score from character diversity
-    if japanese_chars > 0 && english_chars > 0 {
-        score += 20.0; // Bonus for multilingual filenames
-    } else if japanese_chars > 5 {
-        score += 15.0; // Good Japanese description
+    // Base score from character diversity - prioritize Japanese
+    if japanese_chars > 0 {
+        score += 25.0; // High priority for Japanese content
+        if english_chars > 0 {
+            score += 10.0; // Additional bonus for multilingual
+        }
+        // Extra bonus for substantial Japanese content
+        if japanese_chars > 5 {
+            score += 10.0;
+        }
     } else if english_chars > 10 {
-        score += 10.0; // Good English description
+        score += 10.0; // Good English description (lower priority)
     }
 
     // Word count score (more words = more descriptive)
